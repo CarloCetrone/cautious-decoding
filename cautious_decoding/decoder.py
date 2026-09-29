@@ -119,12 +119,11 @@ class CautiousDecoder:
                     seq = seq + leaf.get_token_ids_from_root()
                 batch_token_ids.append(seq)
 
-            # Request a candidate pool of logprobs from vLLM to sample from
-            pool_size = max(breadth * 4, 32)
+            # Request exactly breadth logprobs from vLLM
             sampling_params = vllm.SamplingParams(
                 max_tokens=1,
                 temperature=max(temperature, 1e-5),
-                logprobs=pool_size,
+                logprobs=breadth,
             )
 
             # Prepare prompts in vLLM's TokensPrompt format: [{"prompt_token_ids": seq}, ...]

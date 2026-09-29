@@ -119,11 +119,12 @@ class CautiousDecoder:
                     seq = seq + leaf.get_token_ids_from_root()
                 batch_token_ids.append(seq)
 
-            # Build SamplingParams to get top-B token logprobs for each leaf
+            # Request a candidate pool of logprobs from vLLM to sample from
+            pool_size = max(breadth * 4, 32)
             sampling_params = vllm.SamplingParams(
                 max_tokens=1,
                 temperature=max(temperature, 1e-5),
-                logprobs=breadth,
+                logprobs=pool_size,
             )
 
             # Prepare prompts in vLLM's TokensPrompt format: [{"prompt_token_ids": seq}, ...]
@@ -145,39 +146,62 @@ class CautiousDecoder:
                 )
             num_forward_passes += len(batch_token_ids)
 
-            # Attach top-B candidate children to each parent leaf
+            def _get_logprob(obj: Any) -> float:
+                if hasattr(obj, "logprob"):
+                    return float(obj.logprob)
+                if isinstance(obj, dict):
+                    return float(obj.get("logprob", 0.0))
+                return float(obj)
+
+            def _get_token_text(obj: Any) -> Optional[str]:
+                if hasattr(obj, "decoded_token"):
+                    return obj.decoded_token
+                if isinstance(obj, dict):
+                    return obj.get("decoded_token", None)
+                return None
+
+            # Attach B candidate children to each parent leaf
             for leaf, out in zip(frontier_leaves, outputs):
                 if not out.outputs:
                     continue
                 first_out = out.outputs[0]
                 logprobs_dict = first_out.logprobs[0] if first_out.logprobs else {}
+                items = list(logprobs_dict.items())
 
-                # Sort top tokens by logprob descending and select top B
-                sorted_tokens = sorted(
-                    logprobs_dict.items(),
-                    key=lambda item: (
-                        item[1].logprob
-                        if hasattr(item[1], "logprob")
-                        else (item[1].get("logprob", 0.0) if isinstance(item[1], dict) else float(item[1]))
-                    ),
-                    reverse=True,
-                )[:breadth]
+                if not items:
+                    fallback_id = (
+                        first_out.token_ids[0]
+                        if hasattr(first_out, "token_ids") and first_out.token_ids
+                        else getattr(first_out, "token_id", 0)
+                    )
+                    items = [(fallback_id, 0.0)]
 
-                # Fallback to sampled token if logprobs_dict has fewer than breadth
-                if not sorted_tokens:
-                    tok_id = first_out.token_ids[0] if hasattr(first_out, "token_ids") and first_out.token_ids else getattr(first_out, "token_id", 0)
-                    sorted_tokens = [(tok_id, 0.0)]
+                # Selection strategy based on temperature
+                if temperature <= 1e-5:
+                    # Deterministic greedy top-B selection
+                    sorted_items = sorted(items, key=lambda it: _get_logprob(it[1]), reverse=True)
+                    chosen_items = sorted_items[:breadth]
+                else:
+                    # Stochastic sampling from the top-K distribution scaled by temperature:
+                    # p_i proportional to exp(logprob_i / temperature)
+                    import numpy as np
 
-                for tok_id, logprob_obj in sorted_tokens:
-                    if hasattr(logprob_obj, "logprob"):
-                        lp = logprob_obj.logprob
-                        tok_text = getattr(logprob_obj, "decoded_token", None)
-                    elif isinstance(logprob_obj, dict):
-                        lp = logprob_obj.get("logprob", 0.0)
-                        tok_text = logprob_obj.get("decoded_token", None)
+                    raw_lps = np.array([_get_logprob(it[1]) for it in items], dtype=np.float64)
+                    scaled_lps = (raw_lps - np.max(raw_lps)) / max(temperature, 1e-5)
+                    probs = np.exp(scaled_lps)
+                    probs_sum = np.sum(probs)
+                    if probs_sum > 0:
+                        probs = probs / probs_sum
                     else:
-                        lp = float(logprob_obj)
-                        tok_text = None
+                        probs = np.ones(len(items)) / len(items)
+
+                    k = min(breadth, len(items))
+                    chosen_indices = np.random.choice(len(items), size=k, replace=False, p=probs)
+                    chosen_items = [items[idx] for idx in chosen_indices]
+
+                for tok_id, logprob_obj in chosen_items:
+                    lp = _get_logprob(logprob_obj)
+                    tok_text = _get_token_text(logprob_obj)
                     leaf.add_child(token_id=tok_id, logprob=lp, token_text=tok_text)
 
         # Drain any remaining tokens along the best path if finished before EOS

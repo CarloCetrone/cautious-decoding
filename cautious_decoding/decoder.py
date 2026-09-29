@@ -176,33 +176,24 @@ class CautiousDecoder:
                     )
                     items = [(fallback_id, 0.0)]
 
-                # Selection strategy based on temperature
-                if temperature <= 1e-5:
-                    # Deterministic greedy top-B selection
-                    sorted_items = sorted(items, key=lambda it: _get_logprob(it[1]), reverse=True)
-                    chosen_items = sorted_items[:breadth]
-                else:
-                    # Stochastic sampling from the top-K distribution scaled by temperature:
-                    # p_i proportional to exp(logprob_i / temperature)
-                    import numpy as np
+                # Select the top-B candidate tokens for this distribution (e.g. a, b, c)
+                sorted_items = sorted(items, key=lambda it: _get_logprob(it[1]), reverse=True)[:breadth]
 
-                    raw_lps = np.array([_get_logprob(it[1]) for it in items], dtype=np.float64)
-                    scaled_lps = (raw_lps - np.max(raw_lps)) / max(temperature, 1e-5)
-                    probs = np.exp(scaled_lps)
-                    probs_sum = np.sum(probs)
-                    if probs_sum > 0:
-                        probs = probs / probs_sum
-                    else:
-                        probs = np.ones(len(items)) / len(items)
+                # Temperature scales the distribution over these B candidate tokens:
+                # - When temperature is low: the distribution sharpens, giving the greedy token an overwhelming advantage.
+                # - When temperature is high: the distribution flattens, making candidate tokens equally weighted locally,
+                #   which allows alternative sequences with higher downstream coherence to achieve lower perplexity and win!
+                import numpy as np
 
-                    k = min(breadth, len(items))
-                    chosen_indices = np.random.choice(len(items), size=k, replace=False, p=probs)
-                    chosen_items = [items[idx] for idx in chosen_indices]
+                raw_lps = np.array([_get_logprob(it[1]) for it in sorted_items], dtype=np.float64)
+                effective_temp = max(temperature, 1e-5)
+                scaled_lps = raw_lps / effective_temp
+                log_sum_exp = np.max(scaled_lps) + np.log(np.sum(np.exp(scaled_lps - np.max(scaled_lps))))
+                temp_scaled_lps = scaled_lps - log_sum_exp
 
-                for tok_id, logprob_obj in chosen_items:
-                    lp = _get_logprob(logprob_obj)
+                for (tok_id, logprob_obj), temp_lp in zip(sorted_items, temp_scaled_lps):
                     tok_text = _get_token_text(logprob_obj)
-                    leaf.add_child(token_id=tok_id, logprob=lp, token_text=tok_text)
+                    leaf.add_child(token_id=tok_id, logprob=float(temp_lp), token_text=tok_text)
 
         # Drain any remaining tokens along the best path if finished before EOS
         if tree.get_all_root_to_leaf_paths() and (

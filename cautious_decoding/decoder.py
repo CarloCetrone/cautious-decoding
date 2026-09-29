@@ -126,12 +126,23 @@ class CautiousDecoder:
                 logprobs=breadth,
             )
 
+            # Prepare prompts in vLLM's TokensPrompt format: [{"prompt_token_ids": seq}, ...]
+            prompts = [{"prompt_token_ids": seq} for seq in batch_token_ids]
+
             # Batched forward pass over all active leaves (reusing prefix KV cache)
-            outputs = self.llm.generate(
-                prompt_token_ids=batch_token_ids,
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
+            try:
+                outputs = self.llm.generate(
+                    prompts=prompts,
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
+            except TypeError:
+                # Compatibility fallback for older vLLM releases that used prompt_token_ids
+                outputs = self.llm.generate(
+                    prompt_token_ids=batch_token_ids,
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
             num_forward_passes += len(batch_token_ids)
 
             # Attach top-B candidate children to each parent leaf
@@ -144,18 +155,29 @@ class CautiousDecoder:
                 # Sort top tokens by logprob descending and select top B
                 sorted_tokens = sorted(
                     logprobs_dict.items(),
-                    key=lambda item: item[1].logprob if hasattr(item[1], "logprob") else item[1],
+                    key=lambda item: (
+                        item[1].logprob
+                        if hasattr(item[1], "logprob")
+                        else (item[1].get("logprob", 0.0) if isinstance(item[1], dict) else float(item[1]))
+                    ),
                     reverse=True,
                 )[:breadth]
 
                 # Fallback to sampled token if logprobs_dict has fewer than breadth
                 if not sorted_tokens:
-                    tok_id = first_out.token_id
+                    tok_id = first_out.token_ids[0] if hasattr(first_out, "token_ids") and first_out.token_ids else getattr(first_out, "token_id", 0)
                     sorted_tokens = [(tok_id, 0.0)]
 
                 for tok_id, logprob_obj in sorted_tokens:
-                    lp = logprob_obj.logprob if hasattr(logprob_obj, "logprob") else float(logprob_obj)
-                    tok_text = getattr(logprob_obj, "decoded_token", None)
+                    if hasattr(logprob_obj, "logprob"):
+                        lp = logprob_obj.logprob
+                        tok_text = getattr(logprob_obj, "decoded_token", None)
+                    elif isinstance(logprob_obj, dict):
+                        lp = logprob_obj.get("logprob", 0.0)
+                        tok_text = logprob_obj.get("decoded_token", None)
+                    else:
+                        lp = float(logprob_obj)
+                        tok_text = None
                     leaf.add_child(token_id=tok_id, logprob=lp, token_text=tok_text)
 
         # Drain any remaining tokens along the best path if finished before EOS

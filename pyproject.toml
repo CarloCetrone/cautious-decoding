@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-cautious-decoding"
+version = "0.1.0"
+description = "Cautious Tree Search Decoding plugin for vLLM"
+authors = [{ name = "Carlo Cetrone" }]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "vllm>=0.6.0"
+]
+
+[project.entry-points."vllm.general_plugins"]
+cautious_decoding = "cautious_decoding.plugin:register"
